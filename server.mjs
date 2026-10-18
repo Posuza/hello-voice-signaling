@@ -200,12 +200,12 @@ function updateMember(room, peerId, patch, announce = true) {
   return entry;
 }
 
-function patchMember(room, peerId, patch) {
+function patchMember(room, peerId, patch, announce = true) {
   const entry = room.peers.get(peerId);
   if (!entry) return null;
   const changed = Object.entries(patch).some(([key, value]) => entry.user[key] !== value);
   if (!changed) return entry;
-  return updateMember(room, peerId, patch);
+  return updateMember(room, peerId, patch, announce);
 }
 
 function pickCaster(room) {
@@ -224,20 +224,20 @@ function pickCaster(room) {
   return { casterId: caster.user.id, standbyId: standby?.user.id ?? null };
 }
 
-function rebalanceBroadcast(room) {
+function rebalanceBroadcast(room, announce = true) {
   const { casterId, standbyId } = pickCaster(room);
   room.casterPeerId = casterId;
   room.standbyCasterPeerId = standbyId;
 
   for (const speaker of speakers(room)) {
     const broadcastRole = speaker.user.id === casterId ? "caster" : speaker.user.id === standbyId ? "standby" : null;
-    patchMember(room, speaker.user.id, { broadcastRole, broadcastParentPeerId: null, relayPeerId: null });
+    patchMember(room, speaker.user.id, { broadcastRole, broadcastParentPeerId: null, relayPeerId: null }, announce);
   }
 
   const audience = listeners(room).slice().sort((a, b) => (a.user.joinOrder || 0) - (b.user.joinOrder || 0));
   if (!casterId || !audience.length) {
     for (const listener of audience) {
-      patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: null, relayPeerId: null });
+      patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: null, relayPeerId: null }, announce);
       if (!casterId) send(listener.ws, { type: "relay-unavailable" });
     }
     return;
@@ -259,7 +259,7 @@ function rebalanceBroadcast(room) {
   const childCapacity = Math.max(0, LISTENERS_PER_RELAY - 1);
 
   for (const relayId of relayIds) {
-    patchMember(room, relayId, { broadcastRole: "relay", broadcastParentPeerId: casterId, relayPeerId: casterId });
+    patchMember(room, relayId, { broadcastRole: "relay", broadcastParentPeerId: casterId, relayPeerId: casterId }, announce);
   }
 
   // Preserve stable child assignments when the relay still exists and has room.
@@ -272,7 +272,7 @@ function rebalanceBroadcast(room) {
     if (load >= childCapacity) continue;
     childLoads.set(currentParent, load + 1);
     preservedChildren.add(listener.user.id);
-    patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: currentParent, relayPeerId: currentParent });
+    patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: currentParent, relayPeerId: currentParent }, announce);
   }
 
   for (const listener of audience) {
@@ -281,11 +281,11 @@ function rebalanceBroadcast(room) {
       .slice()
       .sort((a, b) => (childLoads.get(a) || 0) - (childLoads.get(b) || 0))[0];
     if (!target) {
-      patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: null, relayPeerId: null });
+      patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: null, relayPeerId: null }, announce);
       continue;
     }
     childLoads.set(target, (childLoads.get(target) || 0) + 1);
-    patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: target, relayPeerId: target });
+    patchMember(room, listener.user.id, { broadcastRole: null, broadcastParentPeerId: target, relayPeerId: target }, announce);
   }
 }
 
@@ -568,8 +568,8 @@ wss.on("connection", ws => {
     if (msg.type === "accept-mic") {
       if (sender.user.role === "speaker") return;
       if (speakers(room).length >= MAX_SPEAKERS) return send(ws, { type: "error", message: "All speaker seats are full" });
-      updateMember(room, meta.peerId, { role: "speaker", relayPeerId: null, requestedMic: false, speaking: false, selfMuted: false, hostMuted: false, muted: false, seatIndex: nextSeatIndex(room) });
-      rebalanceBroadcast(room);
+      updateMember(room, meta.peerId, { role: "speaker", relayPeerId: null, requestedMic: false, speaking: false, selfMuted: false, hostMuted: false, muted: false, seatIndex: nextSeatIndex(room) }, false);
+      rebalanceBroadcast(room, false);
       scheduleTopology(room);
       return;
     }
@@ -589,8 +589,8 @@ wss.on("connection", ws => {
       if (sender.user.role !== "speaker" || sender.user.isHost) return;
       const remainingSpeakers = speakers(room).filter(entry => entry.user.id !== meta.peerId);
       if (!remainingSpeakers.length) return send(ws, { type: "error", message: "At least one table speaker is required" });
-      updateMember(room, meta.peerId, { role: "listener", relayPeerId: null, requestedMic: false, speaking: false, selfMuted: false, hostMuted: false, muted: false, seatIndex: null });
-      rebalanceBroadcast(room);
+      updateMember(room, meta.peerId, { role: "listener", relayPeerId: null, requestedMic: false, speaking: false, selfMuted: false, hostMuted: false, muted: false, seatIndex: null }, false);
+      rebalanceBroadcast(room, false);
       scheduleTopology(room);
       return;
     }
@@ -602,8 +602,8 @@ wss.on("connection", ws => {
       if (target?.user.role !== "speaker") return;
       const remainingSpeakers = speakers(room).filter(entry => entry.user.id !== peerId);
       if (!remainingSpeakers.length) return send(ws, { type: "error", message: "At least one speaker is required" });
-      updateMember(room, peerId, { role: "listener", relayPeerId: null, requestedMic: false, speaking: false, selfMuted: false, hostMuted: false, muted: false, seatIndex: null });
-      rebalanceBroadcast(room);
+      updateMember(room, peerId, { role: "listener", relayPeerId: null, requestedMic: false, speaking: false, selfMuted: false, hostMuted: false, muted: false, seatIndex: null }, false);
+      rebalanceBroadcast(room, false);
       scheduleTopology(room);
       return;
     }
