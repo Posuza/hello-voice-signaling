@@ -108,10 +108,14 @@ function callEnd(callId, reason = "ended") {
 async function handleCall(ws, msg) {
   if (msg.type === "call-register") {
     const identity = await verifyCallToken(msg.token);
+    if (ws.readyState !== WebSocket.OPEN) return;
     if (!identity) { console.warn("[call] registration rejected: token verification failed; check HELLO_VOICE_APP_ORIGIN and /api/call-verify reachability"); send(ws, { type: "call-error", message: "Authentication required" }); ws.close(4003, "Authentication required"); return; }
     if (ws.callIdentity) return;
     const previous = callUsers.get(identity.id);
-    if (previous && previous !== ws) { try { previous.close(4001, "New connection"); } catch {} }
+    if (previous && previous !== ws) {
+      for (const [callId, call] of activeCalls) if (call.from === identity.id || call.to === identity.id) callEnd(callId, "disconnected");
+      try { previous.close(4001, "New connection"); } catch {}
+    }
     ws.callIdentity = identity;
     console.info("[call] registration accepted", { userId: identity.id });
     callUsers.set(identity.id, ws);
@@ -158,7 +162,7 @@ setInterval(() => {
 
 
 function send(ws, payload) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
 }
 function broadcast(room, payload, except) {
   for (const entry of room.peers.values()) if (entry.ws !== except) send(entry.ws, payload);
@@ -392,6 +396,7 @@ wss.on("connection", ws => {
     let msg;
     try { msg = JSON.parse(raw.toString()); }
     catch { return send(ws, { type: "error", message: "Invalid JSON" }); }
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) return send(ws, { type: "error", message: "Invalid message" });
 
     if(msg.type==='chat-register'){
       void (async () => {const identity=await verifyCallToken(msg.token);
