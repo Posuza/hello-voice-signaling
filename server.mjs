@@ -31,6 +31,8 @@ const UPSTASH_URL=(process.env.UPSTASH_REDIS_REST_URL||'').replace(/\/$/,'');
 const UPSTASH_TOKEN=process.env.UPSTASH_REDIS_REST_TOKEN||'';
 const PERSIST_URL=process.env.MESSAGE_PERSIST_URL||'';
 const WORKER_SECRET=process.env.QUEUE_WORKER_SECRET||'';
+const CHAT_STREAM='hv:messages:v92';
+const CHAT_SAVE_SCRIPT="local existing = redis.call('GET', KEYS[3]); if existing then return existing end; redis.call('XADD', KEYS[1], '*', 'payload', ARGV[1]); redis.call('SET', KEYS[3], ARGV[1], 'EX', 604800); redis.call('PUBLISH', KEYS[2], ARGV[1]); return ARGV[1]";
 let liveCursor='$'; let pollBusy=false; let persistBusy=false;
 async function streamCommand(command){
  const r=await fetch(UPSTASH_URL,{method:'POST',headers:{Authorization:`Bearer ${UPSTASH_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(command),signal:AbortSignal.timeout(3500)});
@@ -363,7 +365,37 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ rooms: roomStats(), maxSpeakers: MAX_SPEAKERS, maxListeners: MAX_LISTENERS, listenersPerRelay: LISTENERS_PER_RELAY, maxRelays: MAX_RELAYS }));
   }
   res.writeHead(200);
-  res.end(JSON.stringify({ ok: true, service: "hello-voice-signaling", protocol: 83, mode: "p2p-conversation-caster-relay", maxSpeakers: MAX_SPEAKERS, maxListeners: MAX_LISTENERS, listenersPerRelay: LISTENERS_PER_RELAY, maxRelays: MAX_RELAYS }));
+  const memory=process.memoryUsage();
+  const roomValues=[...rooms.values()];
+  const roomEntries=roomValues.flatMap(room=>entries(room));
+  const chatConnections=[...liveClients.values()].reduce((total,clients)=>total+clients.size,0);
+  res.end(JSON.stringify({
+    ok:true,
+    service:"hello-voice-signaling",
+    protocol:83,
+    mode:"p2p-conversation-caster-relay",
+    uptimeSeconds:Math.floor(process.uptime()),
+    activeRooms:rooms.size,
+    roomPeers:roomEntries.length,
+    speakerConnections:roomEntries.filter(entry=>entry.user.role==="speaker").length,
+    listenerConnections:roomEntries.filter(entry=>entry.user.role==="listener").length,
+    relayConnections:roomEntries.filter(entry=>entry.user.broadcastRole==="relay").length,
+    websocketConnections:wss.clients.size,
+    chatUsers:liveClients.size,
+    chatConnections,
+    registeredCallUsers:callUsers.size,
+    activeCalls:activeCalls.size,
+    memoryMB:Math.round(memory.rss/1024/1024),
+    heapUsedMB:Math.round(memory.heapUsed/1024/1024),
+    heapTotalMB:Math.round(memory.heapTotal/1024/1024),
+    heapPressurePercent:memory.heapTotal?Math.round(memory.heapUsed/memory.heapTotal*100):0,
+    maxSpeakers:MAX_SPEAKERS,
+    maxListeners:MAX_LISTENERS,
+    listenersPerRelay:LISTENERS_PER_RELAY,
+    maxRelays:MAX_RELAYS,
+    integrations:{roomPolicy:Boolean(POLICY_URL),realtimeChat:Boolean(UPSTASH_URL&&UPSTASH_TOKEN),messagePersistence:Boolean(PERSIST_URL&&WORKER_SECRET),callVerification:Boolean(CALL_VERIFY_ORIGIN)},
+    moderation:["host controls","invite to mic","approve or reject mic","force mute","demote speaker","kick participant","close room"]
+  }));
 });
 
 // Bound incoming frames to protect the signaling process from huge messages.
@@ -404,7 +436,28 @@ wss.on("connection", ws => {
       ws.chatIdentity=identity;
       if(!liveClients.has(identity.id))liveClients.set(identity.id,new Set());
       liveClients.get(identity.id).add(ws);
-      send(ws,{type:'chat-registered'});})(); return;
+      send(ws,{type:'chat-registered',send:!!(UPSTASH_URL&&UPSTASH_TOKEN)});})(); return;
+    }
+    if(msg.type==='chat-send'){
+      const id=String(msg.id||'');
+      const receiverId=String(msg.to||'');
+      const text=String(msg.text||'').trim().slice(0,1000);
+      if(!ws.chatIdentity||!UPSTASH_URL||!UPSTASH_TOKEN){send(ws,{type:'chat-error',id,message:'Realtime chat unavailable'});return}
+      if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)||
+         !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(receiverId)||
+         receiverId===ws.chatIdentity.id||!text){send(ws,{type:'chat-error',id,message:'Invalid message'});return}
+      const now=Date.now();
+      if(now-(ws.chatWindowAt||0)>=1000){ws.chatWindowAt=now;ws.chatCount=0}
+      if(++ws.chatCount>5){send(ws,{type:'chat-error',id,message:'Sending too quickly'});return}
+      const message={id,senderId:ws.chatIdentity.id,receiverId,text,at:new Date().toISOString(),kind:'message:new'};
+      void (async()=>{
+        try{
+          const saved=JSON.parse(String(await streamCommand(['EVAL',CHAT_SAVE_SCRIPT,3,CHAT_STREAM,`hv:messages:user:${receiverId}`,`hv:messages:id:${id}`,JSON.stringify(message)])));
+          if(saved.id!==id||saved.senderId!==message.senderId||saved.receiverId!==receiverId||saved.text!==text)throw Error('Message ID conflict');
+          for(const uid of [saved.receiverId,saved.senderId])for(const client of liveClients.get(uid)||[])send(client,{type:'chat-message',message:saved});
+          send(ws,{type:'chat-saved',message:saved});
+        }catch(error){send(ws,{type:'chat-error',id,message:error instanceof Error?error.message:'Message could not be saved'})}
+      })();return;
     }
     if (typeof msg.type === "string" && msg.type.startsWith("call-")) {
       void handleCall(ws, msg).catch(() => send(ws,{type:"call-error",message:"Signaling verification unavailable"}));
